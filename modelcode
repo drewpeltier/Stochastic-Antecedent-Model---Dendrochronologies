@@ -1,0 +1,206 @@
+###########################################################
+###########################################################
+#Stochastic Antecedent Model of tree ring dendrochronologies
+#Looping variables are consistently named throughout.
+#Operations are roughly ordered as follows:
+#1) Construct antecedent variables, calculate pseudo-means (for centering),
+#   and summing steps.
+#2) Likelihood
+#3) Mean model
+#4) Prior Distributions
+###########################################################
+###########################################################
+model{
+  #calculate "pseudo-mean" antecedent variables
+  
+  for(v in 1:V){ #variable 1=precipitation, 2= temperature, 3=PDSI
+    for(c in 1:C){ #site (or chronology) C=367
+      for(l in 1:L){  #lag (in years) up to l=5, l=1 is current growing season
+        for(m in 1:M){ #month 1-12
+          antm1[m,l,v,c] <- delta[species[c],m,l,v]* #deltas are non-identifiable weights
+            (    equals(v,1)*Pmean[c,m] #data means calculated outside model
+                 + equals(v,2)*Tmean[c,m]
+                 + equals(v,3)*Dmean[c,m] )
+        }
+        antm2[l,v,c]<-sum(antm1[1:12,l,v,c])
+      }
+      antM[v,c]<-sum(antm2[1:5,v,c])
+    }
+  }
+  
+  # Compute antecedent climate variables for climate variable v and time into the
+  # past l (l = 1 is the current year):
+  for(s in 1:S){ #species; S=8
+    for(v in 1:V){
+      for(j in 1:B){ #block, 1-38, these are the 35 "free weights" described in methods section (3 set to zero below) 
+        #block weights
+        weightX[s,j,v] <- deltaX[s,j,v]/sum(deltaX[s,,v]) #calculate identifiable block weights
+      }
+    }
+    
+    # Calculate sums
+    for(v in 1:V){ 
+      for(l in 1:L){
+        Dsum1[s,l,v]<-sum(delta[s,1:12,l,v]) #across months
+        Wsum1[s,l,v]<-sum(weight[s,1:12,l,v])
+      }
+      Dsum[s,v] <- sum(Dsum1[s,1:5,v]) #sum deltas across lags
+      Wsum[s,v] <- sum(Wsum1[s,1:5,v])
+    }
+    
+    for(m in 1:M){ #month
+      for(v in 1:V){ #variable
+        for(l in 1:L){ #Nlag
+          #extract monthly x lag x climvar delta from blockwise deltaX
+          #this creates the vectors of 60 deltas that we use in the model, from the 35 "free" weights (for each variable v) 
+          delta[s,m,l,v] <- (deltaX[s,block[l,m],v]/bsize[l])*(1-equals(l,1)*step(m-9.5)) #set current year post growing season weights a priori to zero
+          weight[s,m,l,v] <- delta[s,m,l,v]/Dsum[s,v] #compute identifiable weights
+          weightOrdered[s,(l-1)*12 + (12-m+1),v] <- weight[s,m,l,v] #reorder weights for ease of interpretation later
+        } 
+      } 
+    }
+    
+    for(l in 1:L){
+      for(v in 1:V){
+        # Compute identifiable year weights:
+        yr.w[s,l,v] <- sum(weight[s,1:12,l,v]) #construct annual weights ("W" in manuscript)
+      }
+    }
+  }#close species loop
+  
+  # Construct the antecedent variable:
+  # in this case we use are using a computational "trick" to speed convergence time
+  # We multiply the climate data by the nonidentifiable weight (delta) rather than the identifiable weight ("weight").
+  # Later we "re-identify" the parameters of interest.
+  for(m in 1:M){
+    for(v in 1:V){ 
+      for(l in 1:L){ 
+        for(y in 1:Y){ #year on chronology, Y is maximum length of a chronology
+          for(c in 1:C){
+            antX1[m,y,l,v,c] <-  equals(v,1)* delta[species[c],m,l,v]*ppt[c,48+12*(y-1) + m -(l-1)*12] 
+            + equals(v,2)* delta[species[c],m,l,v]*temp[c,48+12*(y-1) + m -(l-1)*12] 
+            + equals(v,3)* delta[species[c],m,l,v]*PDSI[c,48+12*(y-1) + m -(l-1)*12]
+            #This indexing is to correct for series starting 9 years later than climate data_ and also a 5 year lag  
+            #crn dataset runs from 1906 to 2007
+            #climdata runs from 1906 to 2014
+          }  
+        }
+      } 
+    }
+  }
+  
+  for(y in 1:Y){
+    for(v in 1:V){
+      for(l in 1:L){ 
+        for(c in 1:C){
+          # Compute the antecedent variable by summing the weighted variables
+          # First sum over past months:  
+          ant_sum1[y,l,v,c] <- (antX1[1,y,l,v,c]+antX1[2,y,l,v,c]+antX1[3,y,l,v,c]+antX1[4,y,l,v,c]+
+                                  antX1[5,y,l,v,c]+antX1[6,y,l,v,c]+antX1[7,y,l,v,c]+antX1[8,y,l,v,c]+antX1[9,y,l,v,c]+antX1[10,y,l,v,c]
+                                +antX1[11,y,l,v,c]+antX1[12,y,l,v,c])
+        }
+      }
+      #either ppt or temp
+      # Now sum over past years, this will be used in mean model (below)
+      for(c in 1:C){
+        antX[y,v,c] <- (ant_sum1[y,1,v,c]+ant_sum1[y,2,v,c]+ant_sum1[y,3,v,c]
+                        +ant_sum1[y,4,v,c]+ant_sum1[y,5,v,c])
+      }
+    }
+  }
+  
+  ###########################################################
+  # Likelihood for log ring-width data: 
+  ###########################################################
+  for(i in 1:I){
+    logwidth[i] ~ dnorm(mu_width[i], tau )  
+    repY[i] ~ dnorm(mu_width[i], tau ) #replicated data for for computing R2 later
+    ###########################################################
+    # Mean model with effect of past ring-width (a[7,c]).
+    # This is simply a linear regression on the (centered) antecedent covariates and AR1
+    ###########################################################
+    mu_width[i] <- a[1,site[i]] #intercept (baseline growth)
+    + a[2,site[i]]* ( antX[year[i],1,site[i]]- antM[1,site[i]] ) #antecedent covariates antX are centered about "pseudo-mean" antecedent covariates antM
+    + a[3,site[i]]*(antX[year[i],2,site[i]]-antM[2,site[i]])
+    + a[4,site[i]]*(antX[year[i],3,site[i]]-antM[3,site[i]]) 
+    + a[5,site[i]]*(antX[year[i],1,site[i]]-antM[1,site[i]]) *(antX[year[i],3,site[i]]-antM[3,site[i]]) #interaction
+    + a[6,site[i]]*(antX[year[i],2,site[i]]-antM[2,site[i]]) *(antX[year[i],3,site[i]]-antM[3,site[i]]) #interaction
+    + log( a[7,site[i]]*ARRW[i] + 1 ) #AR1 term on log scale
+    
+    # chronology 114 has many missing years.
+    #data likelihood
+    ARRW[i] ~ dnorm(0,0.0001)I(0,)
+  }
+  ###########################################################
+  #Compute identifiable parameters
+  ###########################################################
+  # Second part of the computational "tricks"; Dsum is sum of non-identifiable weights (deltas)
+  #Compute identifiable parameters only for those parameters multiplied by non-identifiable antX (these are monitored)
+  for(c in 1:C){#site
+    a_star[1,c]<-a[1,c]
+    a_star[2,c]<-a[2,c]*Dsum[species[c],1]
+    a_star[3,c]<-a[3,c]*Dsum[species[c],2]
+    a_star[4,c]<-a[4,c]*Dsum[species[c],3]  
+    a_star[5,c]<-a[5,c]*Dsum[species[c],1]*Dsum[species[c],3]
+    a_star[6,c]<-a[6,c]*Dsum[species[c],2]*Dsum[species[c],3]
+    a_star[7,c]<-a[7,c]
+  }
+  #compute identifiable species level parameters only for those parameters multiplied by non-identifiable antX (these are monitored):
+  for(s in 1:S){
+    mu_a_sp.star[1,s]<-mu_a_sp[1,s]
+    mu_a_sp.star[2,s]<-mu_a_sp[2,s]*Dsum[s,1]
+    mu_a_sp.star[3,s]<-mu_a_sp[3,s]*Dsum[s,2]
+    mu_a_sp.star[4,s]<-mu_a_sp[4,s]*Dsum[s,3]
+    mu_a_sp.star[5,s]<-mu_a_sp[5,s]*Dsum[s,1]*Dsum[s,3]
+    mu_a_sp.star[6,s]<-mu_a_sp[6,s]*Dsum[s,2]*Dsum[s,3]
+    mu_a_sp.star[7,s]<-mu_a_sp[7,s]
+  }
+  
+ 
+  ###########################################################
+  #Prior distributions
+  ###########################################################
+  # Block delta priors
+  for(s in 1:S){
+    for(v in 1:V){
+      for(j in 1:B){
+        deltaX[s,j,v] ~ dgamma(1, 1) #part of the Dirichlet prior given to the weights, 
+        #dividing by the sum of weights (above) makes them sum to 1
+      } 
+    }
+  }
+  # and assign relatively non-informative priors to sd
+  # parameters:    
+  for(p in 1:6){
+    tau_a[p] <- pow((1/sig_a[p]), 2)
+    sig_a[p] ~ dunif(0, 100)
+    mu_a[p] ~ dnorm(0, 0.0001) #global mean priors
+  }
+  
+  for(p in 1:6){
+    for(s in 1:S){
+      mu_a_sp[p,s] ~ dnorm(mu_a[p],tau_a[p])  #hierarchical species level priors
+      sig_a_sp[p,s] ~ dunif(0, 100)
+      tau_a_sp[p,s] <- 1 / pow(sig_a_sp[p,s], 2)
+    }
+  } 
+  for(s in 1:S){
+    #prior for AR1 term
+    mu_a_sp[7,s] ~ dunif(0,100)
+    sig_a_sp[7,s] ~ dunif(0, 100)
+    tau_a_sp[7,s] <- 1 / pow(sig_a_sp[7,s], 2)
+  }
+  for(p in 1:6){
+    for(c in 1:C){
+      a[p,c] ~ dnorm(mu_a_sp[p,species[c]], tau_a_sp[p,species[c]]) #hierarchical site-level prior
+    }
+  }
+  
+  for(c in 1:C){
+    a[7,c] ~ dnorm(mu_a_sp[7,species[c]], tau_a_sp[7,species[c]])T(0,) #hierarchical site-level prior for AR1 term
+  }
+  
+  #observation precision (from likelihood)
+  tau ~ dunif(0, 100)
+  sig <- pow((1/tau), 0.5) 
+}
